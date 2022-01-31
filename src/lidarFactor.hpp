@@ -1,5 +1,5 @@
 // Author:   Tong Qin               qintonguav@gmail.com
-// 	         Shaozu Cao 		    saozu.cao@connect.ust.hk
+//           Shaozu Cao             saozu.cao@connect.ust.hk
 
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
@@ -9,6 +9,8 @@
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+
+// used in laserOdometry and laserMapping
 struct LidarEdgeFactor
 {
 	LidarEdgeFactor(Eigen::Vector3d curr_point_, Eigen::Vector3d last_point_a_,
@@ -54,6 +56,8 @@ struct LidarEdgeFactor
 	double s;
 };
 
+
+// used in laserOdometry
 struct LidarPlaneFactor
 {
 	LidarPlaneFactor(Eigen::Vector3d curr_point_, Eigen::Vector3d last_point_j_,
@@ -103,6 +107,8 @@ struct LidarPlaneFactor
 	double s;
 };
 
+
+// used in laserMapping
 struct LidarPlaneNormFactor
 {
 
@@ -138,6 +144,7 @@ struct LidarPlaneNormFactor
 };
 
 
+// unused; commented out in laserMapping
 struct LidarDistanceFactor
 {
 

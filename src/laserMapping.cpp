@@ -3,7 +3,7 @@
 //     Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014. 
 
 // Modifier: Tong Qin               qintonguav@gmail.com
-// 	         Shaozu Cao 		    saozu.cao@connect.ust.hk
+//           Shaozu Cao             saozu.cao@connect.ust.hk
 
 
 // Copyright 2013, Ji Zhang, Carnegie Mellon University
@@ -70,17 +70,14 @@ double timeLaserCloudSurfLast = 0;
 double timeLaserCloudFullRes = 0;
 double timeLaserOdometry = 0;
 
-
-int laserCloudCenWidth = 10;
-int laserCloudCenHeight = 10;
-int laserCloudCenDepth = 5;
+int laserCloudCenWidth = 10;  // x axis
+int laserCloudCenHeight = 10; // y axis
+int laserCloudCenDepth = 5;   // z axis
 const int laserCloudWidth = 21;
 const int laserCloudHeight = 21;
 const int laserCloudDepth = 11;
 
-
 const int laserCloudNum = laserCloudWidth * laserCloudHeight * laserCloudDepth; //4851
-
 
 int laserCloudValidInd[125];
 int laserCloudSurroundInd[125];
@@ -89,21 +86,21 @@ int laserCloudSurroundInd[125];
 pcl::PointCloud<PointType>::Ptr laserCloudCornerLast(new pcl::PointCloud<PointType>());
 pcl::PointCloud<PointType>::Ptr laserCloudSurfLast(new pcl::PointCloud<PointType>());
 
-// ouput: all visualble cube points
+// output: all visible cube points
 pcl::PointCloud<PointType>::Ptr laserCloudSurround(new pcl::PointCloud<PointType>());
 
-// surround points in map to build tree
+// surrounding points in the map to build kd-tree
 pcl::PointCloud<PointType>::Ptr laserCloudCornerFromMap(new pcl::PointCloud<PointType>());
 pcl::PointCloud<PointType>::Ptr laserCloudSurfFromMap(new pcl::PointCloud<PointType>());
 
-//input & output: points in one frame. local --> global
+// input & output: points in one frame (local --> global)
 pcl::PointCloud<PointType>::Ptr laserCloudFullRes(new pcl::PointCloud<PointType>());
 
 // points in every cube
 pcl::PointCloud<PointType>::Ptr laserCloudCornerArray[laserCloudNum];
 pcl::PointCloud<PointType>::Ptr laserCloudSurfArray[laserCloudNum];
 
-//kd-tree
+// kd-tree
 pcl::KdTreeFLANN<PointType>::Ptr kdtreeCornerFromMap(new pcl::KdTreeFLANN<PointType>());
 pcl::KdTreeFLANN<PointType>::Ptr kdtreeSurfFromMap(new pcl::KdTreeFLANN<PointType>());
 
@@ -113,7 +110,7 @@ Eigen::Map<Eigen::Vector3d> t_w_curr(parameters + 4);
 
 // wmap_T_odom * odom_T_curr = wmap_T_curr;
 // transformation between odom's world and map's world frame
-Eigen::Quaterniond q_wmap_wodom(1, 0, 0, 0);
+Eigen::Quaterniond q_wmap_wodom(1, 0, 0, 0); // w, x, y, z for initialization
 Eigen::Vector3d t_wmap_wodom(0, 0, 0);
 
 Eigen::Quaterniond q_wodom_curr(1, 0, 0, 0);
@@ -235,13 +232,14 @@ void process()
 		while (!cornerLastBuf.empty() && !surfLastBuf.empty() &&
 			!fullResBuf.empty() && !odometryBuf.empty())
 		{
+			// preprocessing and sanity check
 			mBuf.lock();
 			while (!odometryBuf.empty() && odometryBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
 				odometryBuf.pop();
 			if (odometryBuf.empty())
 			{
 				mBuf.unlock();
-				break;
+				break; // no new odom data available, break and wait for updates in the buffer
 			}
 
 			while (!surfLastBuf.empty() && surfLastBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
@@ -304,22 +302,38 @@ void process()
 
 			mBuf.unlock();
 
+			// preprocessing done, algorithm begins
+
 			TicToc t_whole;
 
 			transformAssociateToMap();
 
 			TicToc t_shift;
+
+			// adjust/shift the map
+			// map coordinates can be negative numbers, but array index can only start from 0
+			// so we have to shift the map to be always on the positive side
+
+			// find the center of the map given the current frame
+			// the entire map is divided into blocks/cubes of size 50m
+			// now we are computing the coordinate of the center cube, by rounding + an offset
 			int centerCubeI = int((t_w_curr.x() + 25.0) / 50.0) + laserCloudCenWidth;
 			int centerCubeJ = int((t_w_curr.y() + 25.0) / 50.0) + laserCloudCenHeight;
 			int centerCubeK = int((t_w_curr.z() + 25.0) / 50.0) + laserCloudCenDepth;
 
-			if (t_w_curr.x() + 25.0 < 0)
-				centerCubeI--;
-			if (t_w_curr.y() + 25.0 < 0)
-				centerCubeJ--;
-			if (t_w_curr.z() + 25.0 < 0)
-				centerCubeK--;
+			// compensation for the above rounding
+			// "int" will round both (-50, 0) and (0, 50) to 0 (round positive numbers down and round negative numbers up)
+			// and this will cause a conflict for these two ranges (not a one-on-one mapping anymore)
+			// we need to make this adjustment such that we are consistent to round everything down
+			if (t_w_curr.x() + 25.0 < 0) centerCubeI--;
+			if (t_w_curr.y() + 25.0 < 0) centerCubeJ--;
+			if (t_w_curr.z() + 25.0 < 0) centerCubeK--;
 
+			// the following six while loops will shift the map such that
+			// 3 < centerCubeI < 18， 3 < centerCubeJ < 18, 3 < centerCubeK < 8
+			// laserCloudXXX serves as the map boundary (fixed), whereas laserCloudCenXXX will change dynamically
+
+			// centerCubeI is too small --> we are close to the bottom of the map boundary --> shift up
 			while (centerCubeI < 3)
 			{
 				for (int j = 0; j < laserCloudHeight; j++)
@@ -327,10 +341,12 @@ void process()
 					for (int k = 0; k < laserCloudDepth; k++)
 					{ 
 						int i = laserCloudWidth - 1;
+						// save the last pointer
 						pcl::PointCloud<PointType>::Ptr laserCloudCubeCornerPointer =
 							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k]; 
 						pcl::PointCloud<PointType>::Ptr laserCloudCubeSurfPointer =
 							laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
+						// shift pointers
 						for (; i >= 1; i--)
 						{
 							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
@@ -338,6 +354,7 @@ void process()
 							laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 								laserCloudSurfArray[i - 1 + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
 						}
+						// resume the last pointer
 						laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 							laserCloudCubeCornerPointer;
 						laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
@@ -346,11 +363,11 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeI++;
 				laserCloudCenWidth++;
 			}
 
+			// centerCubeI is too large --> we are close to the top of the map boundary --> shift down
 			while (centerCubeI >= laserCloudWidth - 3)
 			{ 
 				for (int j = 0; j < laserCloudHeight; j++)
@@ -377,7 +394,6 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeI--;
 				laserCloudCenWidth--;
 			}
@@ -408,7 +424,6 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeJ++;
 				laserCloudCenHeight++;
 			}
@@ -439,7 +454,6 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeJ--;
 				laserCloudCenHeight--;
 			}
@@ -470,7 +484,6 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeK++;
 				laserCloudCenDepth++;
 			}
@@ -501,14 +514,18 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeK--;
 				laserCloudCenDepth--;
 			}
 
+			// shifting done, now we have the center cube located in the following range
+			// 3 < centerCubeI < 18， 3 < centerCubeJ < 18, 3 < centerCubeK < 8
+
 			int laserCloudValidNum = 0;
 			int laserCloudSurroundNum = 0;
 
+			// compute and save cube indices for the surrounding area
+			// in the real world coordinate, this is an cubic area of the size (5*50m, 5*50m, 3*50m)
 			for (int i = centerCubeI - 2; i <= centerCubeI + 2; i++)
 			{
 				for (int j = centerCubeJ - 2; j <= centerCubeJ + 2; j++)
@@ -519,8 +536,10 @@ void process()
 							j >= 0 && j < laserCloudHeight &&
 							k >= 0 && k < laserCloudDepth)
 						{ 
+							// save valid cube index, for feature matching
 							laserCloudValidInd[laserCloudValidNum] = i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k;
 							laserCloudValidNum++;
+							// save valid cube index, for visualization
 							laserCloudSurroundInd[laserCloudSurroundNum] = i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k;
 							laserCloudSurroundNum++;
 						}
@@ -528,6 +547,7 @@ void process()
 				}
 			}
 
+			// accumulate feature points in the surrounding area for the current frame
 			laserCloudCornerFromMap->clear();
 			laserCloudSurfFromMap->clear();
 			for (int i = 0; i < laserCloudValidNum; i++)
@@ -538,7 +558,7 @@ void process()
 			int laserCloudCornerFromMapNum = laserCloudCornerFromMap->points.size();
 			int laserCloudSurfFromMapNum = laserCloudSurfFromMap->points.size();
 
-
+			// downsample feature points
 			pcl::PointCloud<PointType>::Ptr laserCloudCornerStack(new pcl::PointCloud<PointType>());
 			downSizeFilterCorner.setInputCloud(laserCloudCornerLast);
 			downSizeFilterCorner.filter(*laserCloudCornerStack);
@@ -551,6 +571,8 @@ void process()
 
 			printf("map prepare time %f ms\n", t_shift.toc());
 			printf("map corner num %d  surf num %d \n", laserCloudCornerFromMapNum, laserCloudSurfFromMapNum);
+
+			// start optimization using all feature points accumulated up to now
 			if (laserCloudCornerFromMapNum > 10 && laserCloudSurfFromMapNum > 50)
 			{
 				TicToc t_opt;
@@ -559,6 +581,10 @@ void process()
 				kdtreeSurfFromMap->setInputCloud(laserCloudSurfFromMap);
 				printf("build tree time %f ms \n", t_tree.toc());
 
+				// run optimization twice
+				// find line features and plane features using SVD
+				// for line features, one eigenvalue should be significantly greater than the other two
+				// for plane features, there should be two large eigenvalues with the third one significantly smaller
 				for (int iterCount = 0; iterCount < 2; iterCount++)
 				{
 					//ceres::LossFunction *loss_function = NULL;
@@ -604,8 +630,8 @@ void process()
 
 							Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(covMat);
 
-							// if is indeed line feature
-							// note Eigen library sort eigenvalues in increasing order
+							// check if it is indeed a line feature
+							// note that Eigen library sorts eigenvalues in increasing order
 							Eigen::Vector3d unit_direction = saes.eigenvectors().col(2);
 							Eigen::Vector3d curr_point(pointOri.x, pointOri.y, pointOri.z);
 							if (saes.eigenvalues()[2] > 3 * saes.eigenvalues()[1])
@@ -651,7 +677,6 @@ void process()
 						Eigen::Matrix<double, 5, 1> matB0 = -1 * Eigen::Matrix<double, 5, 1>::Ones();
 						if (pointSearchSqDis[4] < 1.0)
 						{
-							
 							for (int j = 0; j < 5; j++)
 							{
 								matA0(j, 0) = laserCloudSurfFromMap->points[pointSearchInd[j]].x;
@@ -664,7 +689,7 @@ void process()
 							double negative_OA_dot_norm = 1 / norm.norm();
 							norm.normalize();
 
-							// Here n(pa, pb, pc) is unit norm of plane
+							// Here n(pa, pb, pc) is the unit norm of plane
 							bool planeValid = true;
 							for (int j = 0; j < 5; j++)
 							{
@@ -734,6 +759,9 @@ void process()
 			transformUpdate();
 
 			TicToc t_add;
+			// follow the same approach to find cube coordinate and save feature points
+			// CornerStack and SurfStack are the downsampled accumulated feature points in the current frame
+			// CornerArray and SurfArray are the feature points saved in the global map over history
 			for (int i = 0; i < laserCloudCornerStackNum; i++)
 			{
 				pointAssociateToMap(&laserCloudCornerStack->points[i], &pointSel);
@@ -742,12 +770,9 @@ void process()
 				int cubeJ = int((pointSel.y + 25.0) / 50.0) + laserCloudCenHeight;
 				int cubeK = int((pointSel.z + 25.0) / 50.0) + laserCloudCenDepth;
 
-				if (pointSel.x + 25.0 < 0)
-					cubeI--;
-				if (pointSel.y + 25.0 < 0)
-					cubeJ--;
-				if (pointSel.z + 25.0 < 0)
-					cubeK--;
+				if (pointSel.x + 25.0 < 0) cubeI--;
+				if (pointSel.y + 25.0 < 0) cubeJ--;
+				if (pointSel.z + 25.0 < 0) cubeK--;
 
 				if (cubeI >= 0 && cubeI < laserCloudWidth &&
 					cubeJ >= 0 && cubeJ < laserCloudHeight &&
@@ -766,12 +791,9 @@ void process()
 				int cubeJ = int((pointSel.y + 25.0) / 50.0) + laserCloudCenHeight;
 				int cubeK = int((pointSel.z + 25.0) / 50.0) + laserCloudCenDepth;
 
-				if (pointSel.x + 25.0 < 0)
-					cubeI--;
-				if (pointSel.y + 25.0 < 0)
-					cubeJ--;
-				if (pointSel.z + 25.0 < 0)
-					cubeK--;
+				if (pointSel.x + 25.0 < 0) cubeI--;
+				if (pointSel.y + 25.0 < 0) cubeJ--;
+				if (pointSel.z + 25.0 < 0) cubeK--;
 
 				if (cubeI >= 0 && cubeI < laserCloudWidth &&
 					cubeJ >= 0 && cubeJ < laserCloudHeight &&
@@ -783,7 +805,7 @@ void process()
 			}
 			printf("add points time %f ms\n", t_add.toc());
 
-			
+			// downsample CornerArray and SurfArray
 			TicToc t_filter;
 			for (int i = 0; i < laserCloudValidNum; i++)
 			{
@@ -802,7 +824,7 @@ void process()
 			printf("filter time %f ms \n", t_filter.toc());
 			
 			TicToc t_pub;
-			//publish surround map for every 5 frame
+			// publish local map every 5 frames
 			if (frameCount % 5 == 0)
 			{
 				laserCloudSurround->clear();
@@ -820,6 +842,7 @@ void process()
 				pubLaserCloudSurround.publish(laserCloudSurround3);
 			}
 
+			// publish global map every 20 frames
 			if (frameCount % 20 == 0)
 			{
 				pcl::PointCloud<PointType> laserCloudMap;
@@ -887,8 +910,8 @@ void process()
 
 			frameCount++;
 		}
-		std::chrono::milliseconds dura(2);
-        std::this_thread::sleep_for(dura);
+    std::chrono::milliseconds dura(2);
+    std::this_thread::sleep_for(dura);
 	}
 }
 
@@ -932,6 +955,7 @@ int main(int argc, char **argv)
 	}
 
 	std::thread mapping_process{process};
+	// since this is running in a separate thread, mutex lock becomes necessary
 
 	ros::spin();
 

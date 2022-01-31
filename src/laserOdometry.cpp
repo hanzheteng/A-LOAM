@@ -3,7 +3,7 @@
 //     Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014. 
 
 // Modifier: Tong Qin               qintonguav@gmail.com
-// 	         Shaozu Cao 		    saozu.cao@connect.ust.hk
+//           Shaozu Cao             saozu.cao@connect.ust.hk
 
 
 // Copyright 2013, Ji Zhang, Carnegie Mellon University
@@ -63,7 +63,8 @@ int corner_correspondence = 0, plane_correspondence = 0;
 
 constexpr double SCAN_PERIOD = 0.1;
 constexpr double DISTANCE_SQ_THRESHOLD = 25;
-constexpr double NEARBY_SCAN = 2.5;
+constexpr double NEARBY_SCAN = 2.5; // 2 for nearby scan, 0.5 for rounding
+// recall that the range of scanID is [0, 15], in total 16 lines for VLP-16
 
 int skipFrameNum = 5;
 bool systemInited = false;
@@ -90,11 +91,11 @@ int laserCloudCornerLastNum = 0;
 int laserCloudSurfLastNum = 0;
 
 // Transformation from current frame to world frame
-Eigen::Quaterniond q_w_curr(1, 0, 0, 0);
+Eigen::Quaterniond q_w_curr(1, 0, 0, 0); // w, x, y, z for initialization
 Eigen::Vector3d t_w_curr(0, 0, 0);
 
 // q_curr_last(x, y, z, w), t_curr_last
-double para_q[4] = {0, 0, 0, 1};
+double para_q[4] = {0, 0, 0, 1}; // x, y, z, w for internal storage
 double para_t[3] = {0, 0, 0};
 
 Eigen::Map<Eigen::Quaterniond> q_last_curr(para_q);
@@ -107,18 +108,31 @@ std::queue<sensor_msgs::PointCloud2ConstPtr> surfLessFlatBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullPointsBuf;
 std::mutex mBuf;
 
+// Start: the moment that a scan starts (in a 360 deg range)
+// End: the moment that a scan ends (in a 360 deg range)
+
+// TransformToStart: eliminate the influence of (uniform) motion, undistort lidar points such that
+//     they can be regarded as being captured at the Start of the current scan
+// TransformToEnd: eliminate the influence of (uniform) motion, undistort lidar points such that
+//     they can be regarded as being captured at the End of the current scan
+
+// Applying TransformToStart for current scan and TransformToEnd for previous scan
+// can align two scans in the same frame/coordinate, as if they were captured at the same time
+// This can be of great importance if moving in high speed, but minor influence in low speed
+// In the original work of LOAM, this is designed for a rotating 2D lidar with 180 deg FoV
+
 // undistort lidar point
 void TransformToStart(PointType const *const pi, PointType *const po)
 {
     //interpolation ratio
     double s;
-    if (DISTORTION)
+    if (DISTORTION) // recall that point.intensity = scanID + scanPeriod * relTime;
         s = (pi->intensity - int(pi->intensity)) / SCAN_PERIOD;
     else
         s = 1.0;
     //s = 1;
     Eigen::Quaterniond q_point_last = Eigen::Quaterniond::Identity().slerp(s, q_last_curr);
-    Eigen::Vector3d t_point_last = s * t_last_curr;
+    Eigen::Vector3d t_point_last = s * t_last_curr; // slerp for spherical linear interpolation
     Eigen::Vector3d point(pi->x, pi->y, pi->z);
     Eigen::Vector3d un_point = q_point_last * point + t_point_last;
 
@@ -129,7 +143,6 @@ void TransformToStart(PointType const *const pi, PointType *const po)
 }
 
 // transform all lidar points to the start of the next frame
-
 void TransformToEnd(PointType const *const pi, PointType *const po)
 {
     // undistort point first
@@ -143,7 +156,7 @@ void TransformToEnd(PointType const *const pi, PointType *const po)
     po->y = point_end.y();
     po->z = point_end.z();
 
-    //Remove distortion time info
+    // remove distortion time info (keep scanID only, in the integral part)
     po->intensity = int(pi->intensity);
 }
 
@@ -240,7 +253,10 @@ int main(int argc, char **argv)
                 ROS_BREAK();
             }
 
+            // lock seems to be redundant here and in the callbacks
+            // because callback functions will not be executed unless triggered by ros::spinOnce
             mBuf.lock();
+
             cornerPointsSharp->clear();
             pcl::fromROSMsg(*cornerSharpBuf.front(), *cornerPointsSharp);
             cornerSharpBuf.pop();
@@ -260,12 +276,14 @@ int main(int argc, char **argv)
             laserCloudFullRes->clear();
             pcl::fromROSMsg(*fullPointsBuf.front(), *laserCloudFullRes);
             fullPointsBuf.pop();
+
             mBuf.unlock();
 
             TicToc t_whole;
             // initializing
             if (!systemInited)
             {
+                // skip the first frame and send it to laserMapping directly
                 systemInited = true;
                 std::cout << "Initialization finished \n";
             }
@@ -275,6 +293,8 @@ int main(int argc, char **argv)
                 int surfPointsFlatNum = surfPointsFlat->points.size();
 
                 TicToc t_opt;
+                // run optimization twice
+                // this part is discussed in Algorithm 1 in the original LOAM paper
                 for (size_t opti_counter = 0; opti_counter < 2; ++opti_counter)
                 {
                     corner_correspondence = 0;
@@ -290,27 +310,35 @@ int main(int argc, char **argv)
                     problem.AddParameterBlock(para_q, 4, q_parameterization);
                     problem.AddParameterBlock(para_t, 3);
 
-                    pcl::PointXYZI pointSel;
-                    std::vector<int> pointSearchInd;
-                    std::vector<float> pointSearchSqDis;
+                    pcl::PointXYZI pointSel;             // for kd-tree
+                    std::vector<int> pointSearchInd;     // for kd-tree
+                    std::vector<float> pointSearchSqDis; // for kd-tree
 
                     TicToc t_data;
-                    // find correspondence for corner features
+                    // find correspondence for corner features; see Fig. 7(a) in LOAM paper
+                    // note that the correspondence is not a point, but a line consisting of two points
+                    // then we are going to compute point-to-line distance
                     for (int i = 0; i < cornerPointsSharpNum; ++i)
                     {
+                        // for Sharp points in the current frame, find two closest points in the previous frame 
+                        // the first point is found by Kd-tree, and the other one is found by line search
                         TransformToStart(&(cornerPointsSharp->points[i]), &pointSel);
                         kdtreeCornerLast->nearestKSearch(pointSel, 1, pointSearchInd, pointSearchSqDis);
 
+                        // use DISTANCE_SQ_THRESHOLD to filter out points on nearby scans that are actually far away from here
                         int closestPointInd = -1, minPointInd2 = -1;
                         if (pointSearchSqDis[0] < DISTANCE_SQ_THRESHOLD)
                         {
                             closestPointInd = pointSearchInd[0];
                             int closestPointScanID = int(laserCloudCornerLast->points[closestPointInd].intensity);
-
                             double minPointSqDis2 = DISTANCE_SQ_THRESHOLD;
+
                             // search in the direction of increasing scan line
                             for (int j = closestPointInd + 1; j < (int)laserCloudCornerLast->points.size(); ++j)
                             {
+                                // we particularly require that two points j and l are from different scans considering that 
+                                // a single scan cannot contain more than one points from the same edge line.
+
                                 // if in the same scan line, continue
                                 if (int(laserCloudCornerLast->points[j].intensity) <= closestPointScanID)
                                     continue;
@@ -320,15 +348,14 @@ int main(int argc, char **argv)
                                     break;
 
                                 double pointSqDis = (laserCloudCornerLast->points[j].x - pointSel.x) *
-                                                        (laserCloudCornerLast->points[j].x - pointSel.x) +
+                                                    (laserCloudCornerLast->points[j].x - pointSel.x) +
                                                     (laserCloudCornerLast->points[j].y - pointSel.y) *
-                                                        (laserCloudCornerLast->points[j].y - pointSel.y) +
+                                                    (laserCloudCornerLast->points[j].y - pointSel.y) +
                                                     (laserCloudCornerLast->points[j].z - pointSel.z) *
-                                                        (laserCloudCornerLast->points[j].z - pointSel.z);
-
+                                                    (laserCloudCornerLast->points[j].z - pointSel.z);
+                                // update if closer
                                 if (pointSqDis < minPointSqDis2)
                                 {
-                                    // find nearer point
                                     minPointSqDis2 = pointSqDis;
                                     minPointInd2 = j;
                                 }
@@ -346,20 +373,20 @@ int main(int argc, char **argv)
                                     break;
 
                                 double pointSqDis = (laserCloudCornerLast->points[j].x - pointSel.x) *
-                                                        (laserCloudCornerLast->points[j].x - pointSel.x) +
+                                                    (laserCloudCornerLast->points[j].x - pointSel.x) +
                                                     (laserCloudCornerLast->points[j].y - pointSel.y) *
-                                                        (laserCloudCornerLast->points[j].y - pointSel.y) +
+                                                    (laserCloudCornerLast->points[j].y - pointSel.y) +
                                                     (laserCloudCornerLast->points[j].z - pointSel.z) *
-                                                        (laserCloudCornerLast->points[j].z - pointSel.z);
-
+                                                    (laserCloudCornerLast->points[j].z - pointSel.z);
+                                // update if closer
                                 if (pointSqDis < minPointSqDis2)
                                 {
-                                    // find nearer point
                                     minPointSqDis2 = pointSqDis;
                                     minPointInd2 = j;
                                 }
                             }
                         }
+
                         if (minPointInd2 >= 0) // both closestPointInd and minPointInd2 is valid
                         {
                             Eigen::Vector3d curr_point(cornerPointsSharp->points[i].x,
@@ -383,34 +410,38 @@ int main(int argc, char **argv)
                         }
                     }
 
-                    // find correspondence for plane features
+                    // find correspondence for plane features; see Fig. 7(b) in LOAM paper
+                    // note that the correspondence is not a point, but a plane consisting of three points
+                    // then we are going to compute point-to-plane distance
                     for (int i = 0; i < surfPointsFlatNum; ++i)
                     {
                         TransformToStart(&(surfPointsFlat->points[i]), &pointSel);
                         kdtreeSurfLast->nearestKSearch(pointSel, 1, pointSearchInd, pointSearchSqDis);
 
+                        // the first point is found by Kd-tree, and the other two points are found by line search
                         int closestPointInd = -1, minPointInd2 = -1, minPointInd3 = -1;
                         if (pointSearchSqDis[0] < DISTANCE_SQ_THRESHOLD)
                         {
                             closestPointInd = pointSearchInd[0];
-
-                            // get closest point's scan ID
                             int closestPointScanID = int(laserCloudSurfLast->points[closestPointInd].intensity);
                             double minPointSqDis2 = DISTANCE_SQ_THRESHOLD, minPointSqDis3 = DISTANCE_SQ_THRESHOLD;
 
                             // search in the direction of increasing scan line
                             for (int j = closestPointInd + 1; j < (int)laserCloudSurfLast->points.size(); ++j)
                             {
+                                // we need three (non-collinear) points to represent a plane
+                                // two points on the same scan, and the other one on the nearby scan
+
                                 // if not in nearby scans, end the loop
                                 if (int(laserCloudSurfLast->points[j].intensity) > (closestPointScanID + NEARBY_SCAN))
                                     break;
 
                                 double pointSqDis = (laserCloudSurfLast->points[j].x - pointSel.x) *
-                                                        (laserCloudSurfLast->points[j].x - pointSel.x) +
+                                                    (laserCloudSurfLast->points[j].x - pointSel.x) +
                                                     (laserCloudSurfLast->points[j].y - pointSel.y) *
-                                                        (laserCloudSurfLast->points[j].y - pointSel.y) +
+                                                    (laserCloudSurfLast->points[j].y - pointSel.y) +
                                                     (laserCloudSurfLast->points[j].z - pointSel.z) *
-                                                        (laserCloudSurfLast->points[j].z - pointSel.z);
+                                                    (laserCloudSurfLast->points[j].z - pointSel.z);
 
                                 // if in the same or lower scan line
                                 if (int(laserCloudSurfLast->points[j].intensity) <= closestPointScanID && pointSqDis < minPointSqDis2)
@@ -434,11 +465,11 @@ int main(int argc, char **argv)
                                     break;
 
                                 double pointSqDis = (laserCloudSurfLast->points[j].x - pointSel.x) *
-                                                        (laserCloudSurfLast->points[j].x - pointSel.x) +
+                                                    (laserCloudSurfLast->points[j].x - pointSel.x) +
                                                     (laserCloudSurfLast->points[j].y - pointSel.y) *
-                                                        (laserCloudSurfLast->points[j].y - pointSel.y) +
+                                                    (laserCloudSurfLast->points[j].y - pointSel.y) +
                                                     (laserCloudSurfLast->points[j].z - pointSel.z) *
-                                                        (laserCloudSurfLast->points[j].z - pointSel.z);
+                                                    (laserCloudSurfLast->points[j].z - pointSel.z);
 
                                 // if in the same or higher scan line
                                 if (int(laserCloudSurfLast->points[j].intensity) >= closestPointScanID && pointSqDis < minPointSqDis2)
@@ -446,9 +477,9 @@ int main(int argc, char **argv)
                                     minPointSqDis2 = pointSqDis;
                                     minPointInd2 = j;
                                 }
+                                // if in the lower scan line
                                 else if (int(laserCloudSurfLast->points[j].intensity) < closestPointScanID && pointSqDis < minPointSqDis3)
                                 {
-                                    // find nearer point
                                     minPointSqDis3 = pointSqDis;
                                     minPointInd3 = j;
                                 }
@@ -456,7 +487,6 @@ int main(int argc, char **argv)
 
                             if (minPointInd2 >= 0 && minPointInd3 >= 0)
                             {
-
                                 Eigen::Vector3d curr_point(surfPointsFlat->points[i].x,
                                                             surfPointsFlat->points[i].y,
                                                             surfPointsFlat->points[i].z);
@@ -551,6 +581,9 @@ int main(int argc, char **argv)
                 }
             }
 
+            // store points in XXXLast for use in the next frame
+            // recall that LessSharp includes both less sharp (1) and sharp (2) points,
+            //         and LessFlat includes both less flat (0) and flat (-1) points
             pcl::PointCloud<PointType>::Ptr laserCloudTemp = cornerPointsLessSharp;
             cornerPointsLessSharp = laserCloudCornerLast;
             laserCloudCornerLast = laserCloudTemp;
